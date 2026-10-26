@@ -1,6 +1,7 @@
 services:
   itb:
     build: .
+    user: "${UID:-1000}:${GID:-1000}"
     env_file:
       - path: .env
         required: false
