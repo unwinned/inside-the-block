@@ -155,16 +155,16 @@ export async function run(live: boolean) {
     if (top.length) console.log('funded payers:', await sendAndConfirm(top, main!));
   }
 
-  // Slot clock from websocket notifications, with polling as fallback.
+  // Slot clock: getSlot every 300 ms, since the public websocket feed falls behind; the websocket only helps when ahead.
   let slot = epoch.absoluteSlot;
   const ac = new AbortController();
-  let wsAt = 0;
+  let pollAt = 0;
   try {
     const subs = createSolanaRpcSubscriptions(cfg.wsUrl);
     const it = await subs.slotNotifications().subscribe({ abortSignal: ac.signal });
-    (async () => { try { for await (const s of it) { wsAt = Date.now(); if (s.slot > slot) slot = s.slot; } } catch {} })();
+    (async () => { try { for await (const s of it) { if (s.slot > slot) slot = s.slot; } } catch {} })();
   } catch {}
-  (async () => { while (!ac.signal.aborted) { if (Date.now() - wsAt > 1000) { try { const s = await rpc.getSlot({ commitment: 'processed' }).send(); if (s > slot) slot = s; } catch {} } await sleep(150); } })();
+  (async () => { while (!ac.signal.aborted) { try { const s = await rpc.getSlot({ commitment: 'processed' }).send(); pollAt = Date.now(); if (s > slot) slot = s; } catch {} await sleep(300); } })();
   let bh = (await retry(() => rpc.getLatestBlockhash({ commitment: 'confirmed' }).send())).value;
   const bhTimer = setInterval(async () => { try { bh = (await rpc.getLatestBlockhash({ commitment: 'confirmed' }).send()).value; } catch {} }, 3000);
 
@@ -174,7 +174,7 @@ export async function run(live: boolean) {
     const url = cfg.sendUrls[k % cfg.sendUrls.length];
     const trigger = w.start - BigInt(cfg.leadSlots);
     while (slot < trigger - 2n) await sleep(20);
-    if (slot > trigger) { appendFileSync(log, toJson({ runId, probe: k, skipped: 'late', slot, windowStart: w.start }) + '\n'); continue; }
+    if (slot > trigger) { appendFileSync(log, toJson({ runId, probe: k, skipped: 'late', slot, windowStart: w.start, pollAgeMs: Date.now() - pollAt }) + '\n'); continue; }
     const prices = pricesFor(arm, n);
     const cost = prices.reduce((a, c) => a + txFee(c, cfg.cuLimit), 0);
     if (prior + spent + cost > capLamports - n * rent) { console.log('spend cap reached, stopping'); break; }
@@ -206,7 +206,7 @@ export async function run(live: boolean) {
     appendFileSync(log, toJson({
       runId, probe: k, live, arm, path: new URL(url).host, at: new Date().toISOString(),
       identity: w.t.identity, clientId: w.t.clientId, version: w.t.version,
-      windowStart: w.start, windowLen: w.len, trigger, slotAtSend, gapMs: cfg.gapMs, cuLimit: cfg.cuLimit,
+      windowStart: w.start, windowLen: w.len, trigger, slotAtSend, pollAgeMs: Date.now() - pollAt, gapMs: cfg.gapMs, cuLimit: cfg.cuLimit,
       txs: txs.map((t, i) => ({ sig: t.sig, payer: t.payer, sendRank: t.rank, cuPrice: t.cuPrice, tSend: res[i].t0, tAck: res[i].t1, err: res[i].err })),
     }) + '\n');
     process.stdout.write(`\r${k + 1}/${plan.length} ${w.t.clientId.padEnd(18)} slot ${slotAtSend} -> window ${w.start}   `);

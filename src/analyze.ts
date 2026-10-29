@@ -98,18 +98,19 @@ export function analyze() {
   const leaders: Record<string, string> = existsSync(path('leaders.json')) ? readJson(path('leaders.json')) : {};
   const nodes = existsSync(path('nodes.json')) ? readJson(path('nodes.json')) : { nodes: {} };
   const clientOf = (s: number) => nodes.nodes[leaders[s]]?.clientId ?? 'unknown';
-  const byClient = new Map<string, { client: string; lead: number; leaders: Set<string>; arms: Record<string, Arm> }>();
+  const byClient = new Map<string, { client: string; lead: string; leaders: Set<string>; arms: Record<string, Arm> }>();
   const offsets = new Map<string, number>();
   const bucket = (off: number | null, len: number) => off === null ? 'not landed' : off < 0 ? `${off} (before the window)`
     : off < len ? `${off} (target window)` : off < 12 ? '4-11 (after the window)' : '12 or more';
 
-  const rows: string[] = ['probe,at,identity,clientId,arm,path,leadSlots,sig,sendRank,cuPrice,landedSlot,slotOffset,inWindow,index,blockTxs,blockLeader,blockLeaderClient,err'];
+  const rows: string[] = ['probe,at,identity,clientId,arm,path,leadSlots,gapMs,sig,sendRank,cuPrice,landedSlot,slotOffset,inWindow,index,blockTxs,blockLeader,blockLeaderClient,err'];
   const byV = new Map<string, any>();
-  const agg = (id: string, lead: number) => byV.get(`${lead} ${id}`) ?? byV.set(`${lead} ${id}`, { id, lead, probes: 0, txs: 0, landed: 0, inWin: 0, split: 0, multi: 0, arms: {}, desc: [], rho: [] }).get(`${lead} ${id}`);
+  const agg = (id: string, lead: string) => byV.get(`${lead} ${id}`) ?? byV.set(`${lead} ${id}`, { id, lead, probes: 0, txs: 0, landed: 0, inWin: 0, split: 0, multi: 0, arms: {}, desc: [], rho: [] }).get(`${lead} ${id}`);
   const errors = new Map<string, number>();
 
   for (const p of probes) {
-    const lead = p.windowStart - p.trigger;
+    const leadSlots = p.windowStart - p.trigger;
+    const lead = `${leadSlots}/${p.gapMs}`;
     const v = agg(p.identity, lead);
     v.probes++;
     const landed: (Tx & { slot: number })[] = [];
@@ -129,7 +130,7 @@ export function analyze() {
       if (index >= 0) anywhere.push({ ...t, index, slot: st.slot });
       const bk = bucket(off, p.windowLen);
       offsets.set(`${lead}\t${bk}`, (offsets.get(`${lead}\t${bk}`) ?? 0) + 1);
-      rows.push([p.probe, p.at, p.identity, p.clientId, p.arm, p.path, lead, t.sig, t.sendRank, t.cuPrice, st?.slot ?? '', off ?? '', inWin, index, b?.signatures?.length ?? '',
+      rows.push([p.probe, p.at, p.identity, p.clientId, p.arm, p.path, leadSlots, p.gapMs, t.sig, t.sendRank, t.cuPrice, st?.slot ?? '', off ?? '', inWin, index, b?.signatures?.length ?? '',
         st ? leaders[st.slot] ?? '' : '', st ? clientOf(st.slot) : '', JSON.stringify(t.err ?? '')].join(','));
     }
     if (slotsHit.size > 1) v.split++;
@@ -170,35 +171,36 @@ export function analyze() {
   md.push(`# Inside the Block — results`, '',
     `Targets selected ${selectedAt}. Live probes: ${probes.length}, from ${ats[0] ?? '–'} to ${ats.at(-1) ?? '–'} (UTC). All after Alpenglow activation (slot 459,653,000).`,
     `Per-tx raw data: \`data/ours.csv\`, \`data/probes.jsonl\`, \`data/statuses.json\`, \`data/blocks/\`. Every claim can be re-checked with \`getBlock\` on the listed slots.`, '');
-  const order = (k: string) => { const [lead, b] = k.split('\t'); return +lead * 1e10 + (b === 'not landed' ? 1e9 : parseInt(b)); };
+  const rank = (b: string) => b === 'not landed' ? 1e9 : parseInt(b);
+  const order = ([k]: [string, number], [j]: [string, number]) => { const [l1, b1] = k.split('\t'), [l2, b2] = j.split('\t'); return l2.localeCompare(l1) || rank(b1) - rank(b2); };
   const leadTotal = (lead: string) => [...offsets].filter(([k]) => k.startsWith(lead + '\t')).reduce((a, [, n]) => a + n, 0);
-  const vs = [...byV.values()].sort((a, b) => a.lead - b.lead || a.id.localeCompare(b.id));
-  md.push('## Where our transactions landed', '', 'Slot of each tx relative to the first slot of the target window. `LEAD_SLOTS` = how many slots before the window the burst fired.', '',
-    '| LEAD_SLOTS | slot offset | txs | share |', '|---|---|---|---|',
-    ...[...offsets].sort((a, b) => order(a[0]) - order(b[0])).map(([k, n]) => { const [lead, b] = k.split('\t'); return `| ${lead} | ${b} | ${n} | ${pct(n / leadTotal(lead))} |`; }), '');
-  md.push('## Landing', '', '| validator | client | version | stake | LEAD_SLOTS | probes | txs | landed | in target window | bursts split across blocks |', '|---|---|---|---|---|---|---|---|---|---|');
+  const vs = [...byV.values()].sort((a, b) => b.lead.localeCompare(a.lead) || a.id.localeCompare(b.id));
+  md.push('## Where our transactions landed', '', 'Slot of each tx relative to the first slot of the target window. `LEAD_SLOTS` = how many slots before the window the burst fired; `GAP_MS` = pause between the txs of one burst.', '',
+    '| LEAD_SLOTS/GAP_MS | slot offset | txs | share |', '|---|---|---|---|',
+    ...[...offsets].sort(order).map(([k, n]) => { const [lead, b] = k.split('\t'); return `| ${lead} | ${b} | ${n} | ${pct(n / leadTotal(lead))} |`; }), '');
+  md.push('## Landing', '', '| validator | client | version | stake | LEAD_SLOTS/GAP_MS | probes | txs | landed | in target window | bursts split across blocks |', '|---|---|---|---|---|---|---|---|---|---|');
   for (const v of vs) {
     const t: any = T.get(v.id) ?? {};
     md.push(`| \`${v.id.slice(0, 8)}…\` | ${t.clientId} | ${t.version} | ${t.stakePct?.toFixed(2)}% | ${v.lead} | ${v.probes} | ${v.txs} | ${pct(v.landed / v.txs)} | ${pct(v.inWin / v.txs)} | ${pct(v.split / v.probes)} |`);
   }
   md.push('', '## Order of our own transactions inside one block', '',
     'Pairs = every pair of our txs from one burst that landed in the same block. "Fee first" = the higher-fee tx is earlier; "sent first" = the earlier-sent tx is earlier. 95% Wilson intervals. The verdict uses the `fee_vs_send` arm (the two rules predict opposite orders) with a burst-level binomial test, because pairs inside a burst are not independent.', '',
-    '| validator | client | LEAD_SLOTS | arm | bursts in one block | pairs | fee first | sent first | perfect fee order | perfect send order | verdict |', '|---|---|---|---|---|---|---|---|---|---|---|');
+    '| validator | client | LEAD_SLOTS/GAP_MS | arm | bursts in one block | pairs | fee first | sent first | perfect fee order | perfect send order | verdict |', '|---|---|---|---|---|---|---|---|---|---|---|');
   for (const v of vs) for (const [arm, a] of Object.entries<Arm>(v.arms)) {
     const t: any = T.get(v.id) ?? {};
     md.push(`| \`${v.id.slice(0, 8)}…\` | ${t.clientId} | ${v.lead} | ${arm} | ${a.bursts} | ${a.sendN} | ${ci(a.feeK, a.feeN)} | ${ci(a.sendK, a.sendN)} | ${a.perfFee}/${a.bursts} | ${a.perfSend}/${a.bursts} | ${armVerdict(arm, a)} |`);
   }
   md.push('', '## Order of our own transactions, by the client of the leader that built the block', '',
     `Same as above, but every block that holds at least two txs of one burst counts, whichever leader built it. The leader comes from \`getSlotLeaders\`, its client from gossip at collection time (${nodes.at ?? '–'}).`, '',
-    '| client | LEAD_SLOTS | leaders | arm | bursts in one block | pairs | fee first | sent first | perfect fee order | perfect send order | verdict |', '|---|---|---|---|---|---|---|---|---|---|---|');
-  for (const c of [...byClient.values()].sort((a, b) => a.client.localeCompare(b.client) || a.lead - b.lead))
+    '| client | LEAD_SLOTS/GAP_MS | leaders | arm | bursts in one block | pairs | fee first | sent first | perfect fee order | perfect send order | verdict |', '|---|---|---|---|---|---|---|---|---|---|---|');
+  for (const c of [...byClient.values()].sort((a, b) => a.client.localeCompare(b.client) || b.lead.localeCompare(a.lead)))
     for (const arm of ['fee_vs_send', 'fee_with_send', 'equal_fee', 'conflict']) {
       const a = c.arms[arm];
       if (a) md.push(`| ${c.client} | ${c.lead} | ${c.leaders.size} | ${arm} | ${a.bursts} | ${a.sendN} | ${ci(a.feeK, a.feeN)} | ${ci(a.sendK, a.sendN)} | ${a.perfFee}/${a.bursts} | ${a.perfSend}/${a.bursts} | ${armVerdict(arm, a)} |`);
     }
   md.push('', '## Whole blocks (supplementary: other people\'s txs)', '',
     'For blocks of the target leader that contain our txs: share of adjacent tx pairs where priority (prioritization fee per requested CU) does not increase, and Spearman ρ between position and priority (−1 = sorted high→low; 0 = no relation).', '',
-    '| validator | client | LEAD_SLOTS | blocks | adjacent non-increasing | mean ρ |', '|---|---|---|---|---|---|');
+    '| validator | client | LEAD_SLOTS/GAP_MS | blocks | adjacent non-increasing | mean ρ |', '|---|---|---|---|---|---|');
   for (const v of vs) { const t: any = T.get(v.id) ?? {}; md.push(`| \`${v.id.slice(0, 8)}…\` | ${t.clientId} | ${v.lead} | ${v.desc.length} | ${pct(mean(v.desc))} | ${mean(v.rho).toFixed(2)} |`); }
   const skipped = all.filter(p => p.skipped).length;
   md.push('', '## What went wrong (automatic part)', '',
