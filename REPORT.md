@@ -36,14 +36,15 @@ Full design: [README](README.md). In short:
   - `equal_fee`: no fee signal at all;
   - `conflict`: like `fee_vs_send`, but all six txs also write-lock one shared account.
 
-| run | started (UTC) | probes | note |
+| run | bursts sent (UTC) | probes | how it ended |
 |---|---|---|---|
-| 1 | 2026-10-28 17:04 | 12 | stopped by hand to fix the stop logic |
-| 2 | 2026-10-28 17:27 | 42 | hung: the slot websocket died silently |
-| 3 | 2026-10-29 09:48 | 267 of 288 | hung at probe 270: an RPC call without a timeout |
+| 1 | 2026-10-28 17:04:46 – 17:05:51 | 12 of 288 | no burst after 17:05; stopped by hand at 17:20 before a power cut |
+| 2 | 2026-10-28 17:27:16 – 17:31:39 | 42 of 288 | hung: the slot websocket died silently |
+| 3 | 2026-10-29 09:48:35 – 11:04:25 | 267 of 288 | hung at probe 270: an RPC call without a timeout |
 
-All three runs use the same targets, the same settings and the same code path for sending. The fixes are described
-under "What went wrong".
+All three runs use the same targets, the same settings and the same code path for sending. The UTC send time of every
+burst is in the `at` column of `data/ours.csv` and in `data/probes.jsonl`. The fixes are described under
+"What went wrong".
 
 ## 1. Where the bursts landed
 
@@ -123,7 +124,7 @@ leaders per type, so a pattern there is not one operator's setup.
 
 ## What went wrong
 
-- **Run 2 hung at probe 42.** The slot websocket stopped sending without an error, and the polling fallback only
+- **Runs 1 and 2 stopped sending after 12 and 42 probes.** Most likely the cause was the same in both: the slot websocket stopped sending without an error, and the polling fallback only
   started on a subscription error. Fix: poll `getSlot` whenever the websocket has been quiet for over 1 s, and time out
   the raw send after 5 s.
 - **Run 3 hung at probe 270.** A `getSlot` poll never returned. `@solana/kit`'s HTTP transport has no timeout of its
