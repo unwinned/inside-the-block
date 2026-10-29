@@ -1,5 +1,5 @@
 import { mkdirSync, readFileSync } from 'node:fs';
-import { createSolanaRpc } from '@solana/kit';
+import { createDefaultRpcTransport, createSolanaRpcFromTransport } from '@solana/kit';
 
 const env = process.env;
 const list = (v: string | undefined, d: string) => (v || d).split(',').map(s => s.trim()).filter(Boolean);
@@ -24,8 +24,12 @@ export const cfg = {
   alpenglowSlot: 459_653_000n,
 };
 
-export const rpc = createSolanaRpc(cfg.rpcUrl);
-export const collectRpc = createSolanaRpc(cfg.collectUrl);
+const createSolanaRpc = (url: string, ms: number) => {
+  const transport = createDefaultRpcTransport({ url });
+  return createSolanaRpcFromTransport((c => transport({ ...c, signal: c.signal ?? AbortSignal.timeout(ms) })) as typeof transport);
+};
+export const rpc = createSolanaRpc(cfg.rpcUrl, 15_000);
+export const collectRpc = createSolanaRpc(cfg.collectUrl, 120_000);
 
 export const LAMPORTS_PER_SOL = 1_000_000_000;
 export const BASE_FEE = 5_000; // lamports per signature

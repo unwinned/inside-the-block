@@ -94,7 +94,7 @@ async function rawSend(url: string, wire: string) {
   const t0 = performance.timeOrigin + performance.now();
   try {
     const r = await fetch(url, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
+      method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(5000),
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'sendTransaction', params: [wire, { encoding: 'base64', skipPreflight: true, maxRetries: 0 }] }),
     });
     const j: any = await r.json();
@@ -158,13 +158,13 @@ export async function run(live: boolean) {
   // Slot clock from websocket notifications, with polling as fallback.
   let slot = epoch.absoluteSlot;
   const ac = new AbortController();
+  let wsAt = 0;
   try {
     const subs = createSolanaRpcSubscriptions(cfg.wsUrl);
     const it = await subs.slotNotifications().subscribe({ abortSignal: ac.signal });
-    (async () => { try { for await (const s of it) if (s.slot > slot) slot = s.slot; } catch {} })();
-  } catch {
-    (async () => { while (!ac.signal.aborted) { try { slot = await rpc.getSlot({ commitment: 'processed' }).send(); } catch {} await sleep(150); } })();
-  }
+    (async () => { try { for await (const s of it) { wsAt = Date.now(); if (s.slot > slot) slot = s.slot; } } catch {} })();
+  } catch {}
+  (async () => { while (!ac.signal.aborted) { if (Date.now() - wsAt > 1000) { try { const s = await rpc.getSlot({ commitment: 'processed' }).send(); if (s > slot) slot = s; } catch {} } await sleep(150); } })();
   let bh = (await retry(() => rpc.getLatestBlockhash({ commitment: 'confirmed' }).send())).value;
   const bhTimer = setInterval(async () => { try { bh = (await rpc.getLatestBlockhash({ commitment: 'confirmed' }).send()).value; } catch {} }, 3000);
 

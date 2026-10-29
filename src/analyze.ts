@@ -64,6 +64,24 @@ export function verdict(feeK: number, feeN: number, burstK: number, burstN: numb
   return 'no detectable rule (noise)';
 }
 
+type Arm = { feeK: number; feeN: number; sendK: number; sendN: number; bFee: number; bSend: number; bN: number; perfFee: number; perfSend: number; bursts: number };
+const newArm = (): Arm => ({ feeK: 0, feeN: 0, sendK: 0, sendN: 0, bFee: 0, bSend: 0, bN: 0, perfFee: 0, perfSend: 0, bursts: 0 });
+
+function addBurst(arm: Arm, inBlock: Tx[]) {
+  const ps = pairs(inBlock);
+  const f = ps.filter(x => x.fee !== null), fk = f.reduce((a, x) => a + x.fee!, 0), sk = ps.reduce((a, x) => a + x.send, 0);
+  arm.feeK += fk; arm.feeN += f.length; arm.sendK += sk; arm.sendN += ps.length; arm.bursts++;
+  // Burst-level unit (pairs inside one burst are not independent).
+  const key = f.length ? fk / f.length : sk / ps.length, bfeeless = !f.length;
+  if (key !== 0.5) { arm.bN++; if (key > 0.5) bfeeless ? arm.bSend++ : arm.bFee++; }
+  if (f.length && fk === f.length) arm.perfFee++;
+  if (sk === ps.length) arm.perfSend++;
+}
+
+const armVerdict = (arm: string, a: Arm) => arm === 'fee_vs_send' ? verdict(a.feeK, a.feeN, a.bFee, a.bN)
+  : arm === 'equal_fee' ? (a.bN < 4 ? 'insufficient data' : binomP(a.bSend, a.bN) < 0.05 ? (a.bSend / a.bN > 0.5 ? 'arrival order (FIFO-like)' : 'reverse arrival') : 'no detectable rule (noise)')
+  : '';
+
 const pct = (x: number) => (Number.isFinite(x) ? (x * 100).toFixed(0) + '%' : '–');
 const ci = (k: number, n: number) => { const [l, h] = wilson(k, n); return n ? `${pct(k / n)} [${pct(l)}–${pct(h)}]` : '–'; };
 
@@ -72,9 +90,20 @@ export function analyze() {
   const all = readJsonl(path('probes.jsonl'));
   const probes = all.filter(p => p.live && p.txs);
   const statuses = readJson(path('statuses.json'));
-  const block = (s: number) => { const f = path('blocks', `${s}.json`); return existsSync(f) ? readJson(f) : null; };
+  const cache = new Map<number, any>();
+  const block = (s: number) => {
+    if (!cache.has(s)) { const f = path('blocks', `${s}.json`); cache.set(s, existsSync(f) ? readJson(f) : null); }
+    return cache.get(s);
+  };
+  const leaders: Record<string, string> = existsSync(path('leaders.json')) ? readJson(path('leaders.json')) : {};
+  const nodes = existsSync(path('nodes.json')) ? readJson(path('nodes.json')) : { nodes: {} };
+  const clientOf = (s: number) => nodes.nodes[leaders[s]]?.clientId ?? 'unknown';
+  const byClient = new Map<string, { leaders: Set<string>; arms: Record<string, Arm> }>();
+  const offsets = new Map<string, number>();
+  const bucket = (off: number | null, len: number) => off === null ? 'not landed' : off < 0 ? `${off} (before the window)`
+    : off < len ? `${off} (target window)` : off < 12 ? '4-11 (after the window)' : '12 or more';
 
-  const rows: string[] = ['probe,at,identity,clientId,arm,path,sig,sendRank,cuPrice,landedSlot,slotOffset,inWindow,index,blockTxs,err'];
+  const rows: string[] = ['probe,at,identity,clientId,arm,path,sig,sendRank,cuPrice,landedSlot,slotOffset,inWindow,index,blockTxs,blockLeader,blockLeaderClient,err'];
   const byV = new Map<string, any>();
   const agg = (key: string) => byV.get(key) ?? byV.set(key, { probes: 0, txs: 0, landed: 0, inWin: 0, split: 0, multi: 0, arms: {}, desc: [], rho: [] }).get(key);
   const errors = new Map<string, number>();
@@ -83,6 +112,7 @@ export function analyze() {
     const v = agg(p.identity);
     v.probes++;
     const landed: (Tx & { slot: number })[] = [];
+    const anywhere: (Tx & { slot: number })[] = [];
     const slotsHit = new Set<number>();
     for (const t of p.txs) {
       v.txs++;
@@ -95,22 +125,26 @@ export function analyze() {
       if (st) v.landed++;
       if (inWin) { v.inWin++; slotsHit.add(st.slot); }
       if (inWin && index >= 0) landed.push({ ...t, index, slot: st.slot });
-      rows.push([p.probe, p.at, p.identity, p.clientId, p.arm, p.path, t.sig, t.sendRank, t.cuPrice, st?.slot ?? '', off ?? '', inWin, index, b?.signatures?.length ?? '', JSON.stringify(t.err ?? '')].join(','));
+      if (index >= 0) anywhere.push({ ...t, index, slot: st.slot });
+      const bk = bucket(off, p.windowLen);
+      offsets.set(bk, (offsets.get(bk) ?? 0) + 1);
+      rows.push([p.probe, p.at, p.identity, p.clientId, p.arm, p.path, t.sig, t.sendRank, t.cuPrice, st?.slot ?? '', off ?? '', inWin, index, b?.signatures?.length ?? '',
+        st ? leaders[st.slot] ?? '' : '', st ? clientOf(st.slot) : '', JSON.stringify(t.err ?? '')].join(','));
     }
     if (slotsHit.size > 1) v.split++;
-    const arm = v.arms[p.arm] ??= { feeK: 0, feeN: 0, sendK: 0, sendN: 0, bFee: 0, bSend: 0, bN: 0, perfFee: 0, perfSend: 0, bursts: 0 };
+    for (const s of new Set(anywhere.map(t => t.slot))) {
+      const inBlock = anywhere.filter(t => t.slot === s);
+      if (inBlock.length < 2) continue;
+      const c = byClient.get(clientOf(s)) ?? byClient.set(clientOf(s), { leaders: new Set(), arms: {} }).get(clientOf(s))!;
+      c.leaders.add(leaders[s]);
+      addBurst(c.arms[p.arm] ??= newArm(), inBlock);
+    }
+    const arm = v.arms[p.arm] ??= newArm();
     for (const s of slotsHit) {
       const inBlock = landed.filter(t => t.slot === s);
       if (inBlock.length < 2) continue;
       v.multi++;
-      const ps = pairs(inBlock);
-      const f = ps.filter(x => x.fee !== null), fk = f.reduce((a, x) => a + x.fee!, 0), sk = ps.reduce((a, x) => a + x.send, 0);
-      arm.feeK += fk; arm.feeN += f.length; arm.sendK += sk; arm.sendN += ps.length; arm.bursts++;
-      // Burst-level unit (pairs inside one burst are not independent).
-      const key = f.length ? fk / f.length : sk / ps.length, bfeeless = !f.length;
-      if (key !== 0.5) { arm.bN++; if (key > 0.5) bfeeless ? arm.bSend++ : arm.bFee++; }
-      if (f.length && fk === f.length) arm.perfFee++;
-      if (sk === ps.length) arm.perfSend++;
+      addBurst(arm, inBlock);
       // Supplementary: is the whole block sorted by priority?
       const blk = block(s);
       if (blk?.txs && p.windowStart <= s && v.descSlots?.has(s) !== true) {
@@ -134,6 +168,10 @@ export function analyze() {
   md.push(`# Inside the Block — results`, '',
     `Targets selected ${selectedAt}. Live probes: ${probes.length}, from ${ats[0] ?? '–'} to ${ats.at(-1) ?? '–'} (UTC). All after Alpenglow activation (slot 459,653,000).`,
     `Per-tx raw data: \`data/ours.csv\`, \`data/probes.jsonl\`, \`data/statuses.json\`, \`data/blocks/\`. Every claim can be re-checked with \`getBlock\` on the listed slots.`, '');
+  const order = (k: string) => k === 'not landed' ? 1e9 : parseInt(k);
+  md.push('## Where our transactions landed', '', 'Slot of each tx relative to the first slot of the target window. Bursts fire 2 slots before the window.', '',
+    '| slot offset | txs | share |', '|---|---|---|',
+    ...[...offsets].sort((a, b) => order(a[0]) - order(b[0])).map(([k, n]) => `| ${k} | ${n} | ${pct(n / rows.slice(1).length)} |`), '');
   md.push('## Landing', '', '| validator | client | version | stake | probes | txs | landed | in target window | bursts split across blocks |', '|---|---|---|---|---|---|---|---|---|');
   for (const [id, v] of byV) {
     const t: any = T.get(id) ?? {};
@@ -142,11 +180,18 @@ export function analyze() {
   md.push('', '## Order of our own transactions inside one block', '',
     'Pairs = every pair of our txs from one burst that landed in the same block. "Fee first" = the higher-fee tx is earlier; "sent first" = the earlier-sent tx is earlier. 95% Wilson intervals. The verdict uses the `fee_vs_send` arm (the two rules predict opposite orders) with a burst-level binomial test, because pairs inside a burst are not independent.', '',
     '| validator | client | arm | bursts in one block | pairs | fee first | sent first | perfect fee order | perfect send order | verdict |', '|---|---|---|---|---|---|---|---|---|---|');
-  for (const [id, v] of byV) for (const [arm, a] of Object.entries<any>(v.arms)) {
+  for (const [id, v] of byV) for (const [arm, a] of Object.entries<Arm>(v.arms)) {
     const t: any = T.get(id) ?? {};
-    const vd = arm === 'fee_vs_send' ? verdict(a.feeK, a.feeN, a.bFee, a.bN) : arm === 'equal_fee' ? (a.bN >= 4 && binomP(a.bSend, a.bN) < 0.05 ? (a.bSend / a.bN > 0.5 ? 'arrival order (FIFO-like)' : 'reverse arrival') : a.bN < 4 ? 'insufficient data' : 'no detectable rule (noise)') : '';
-    md.push(`| \`${id.slice(0, 8)}…\` | ${t.clientId} | ${arm} | ${a.bursts} | ${a.sendN} | ${ci(a.feeK, a.feeN)} | ${ci(a.sendK, a.sendN)} | ${a.perfFee}/${a.bursts} | ${a.perfSend}/${a.bursts} | ${vd} |`);
+    md.push(`| \`${id.slice(0, 8)}…\` | ${t.clientId} | ${arm} | ${a.bursts} | ${a.sendN} | ${ci(a.feeK, a.feeN)} | ${ci(a.sendK, a.sendN)} | ${a.perfFee}/${a.bursts} | ${a.perfSend}/${a.bursts} | ${armVerdict(arm, a)} |`);
   }
+  md.push('', '## Order of our own transactions, by the client of the leader that built the block', '',
+    `Same as above, but every block that holds at least two txs of one burst counts, whichever leader built it. The leader comes from \`getSlotLeaders\`, its client from gossip at collection time (${nodes.at ?? '–'}).`, '',
+    '| client | leaders | arm | bursts in one block | pairs | fee first | sent first | perfect fee order | perfect send order | verdict |', '|---|---|---|---|---|---|---|---|---|---|');
+  for (const [client, c] of [...byClient].sort((a, b) => a[0].localeCompare(b[0])))
+    for (const arm of ['fee_vs_send', 'fee_with_send', 'equal_fee', 'conflict']) {
+      const a = c.arms[arm];
+      if (a) md.push(`| ${client} | ${c.leaders.size} | ${arm} | ${a.bursts} | ${a.sendN} | ${ci(a.feeK, a.feeN)} | ${ci(a.sendK, a.sendN)} | ${a.perfFee}/${a.bursts} | ${a.perfSend}/${a.bursts} | ${armVerdict(arm, a)} |`);
+    }
   md.push('', '## Whole blocks (supplementary: other people\'s txs)', '',
     'For blocks of the target leader that contain our txs: share of adjacent tx pairs where priority (prioritization fee per requested CU) does not increase, and Spearman ρ between position and priority (−1 = sorted high→low; 0 = no relation).', '',
     '| validator | client | blocks | adjacent non-increasing | mean ρ |', '|---|---|---|---|---|');
